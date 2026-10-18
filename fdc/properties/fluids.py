@@ -12,7 +12,7 @@ Drivers : V02 (feed, via ``FeedCharacterisation``), V04 (pressure),
           V10 / V11 (pot and head temperature), plus the liquid / vapour
           composition at the point of interest.
 Solves  : V12 (fluid properties).  Used downstream by ``hydraulics.py``
-          (rho_V, rho_L, mu, sigma), ``holdup.py``, ``hetp.py`` and the
+          (rho_V, mu_V, rho_L, mu, sigma), ``holdup.py``, ``hetp.py`` and the
           energy balance in ``batch_pot.py`` (latent heat).
 
 Methods
@@ -26,17 +26,20 @@ Per component (T in K, built on the critical constants from ``vle.py``):
 * Surface tension: Brock-Bird corresponding-states correlation.
 * Latent heat    : Chen's equation at the normal boiling point, moved to T with
                    the Watson exponent (0.38).
+* Vapour viscosity: Chung et al. (1988) low-pressure method (nonpolar form),
+                   with the critical volume from Zc = 0.291 - 0.08 omega.
 Mixing rules:
 * Liquid density : ideal volume additivity (mass-fraction weighted 1/rho).
 * Viscosity      : Kendall-Monroe, mu^(1/3) = sum(x_i * mu_i^(1/3)).
 * Surface tension: mole-fraction average.
 * Vapour density : ideal gas, rho = P M / (R T).
+* Vapour viscosity: Herning-Zipperer, mu = sum(y_i mu_i sqrt(M_i)) / sum(y_i sqrt(M_i)).
 * Latent heat    : mole-fraction average, converted to a mass basis.
 
 Conventions
 -----------
 * Public temperatures in degC, pressures in mbar (absolute).
-* Outputs: rho in kg/m3, viscosity in mPa.s, surface tension in mN/m,
+* Outputs: rho in kg/m3, viscosities in mPa.s, surface tension in mN/m,
   latent heat in kJ/kg, molecular weight in g/mol.
 
 Main references
@@ -46,6 +49,8 @@ Main references
   and Liquids", 5th ed. (liquid viscosity, group contributions).
 * Brock & Bird (1955), AIChE J. 1, 174 (surface tension).
 * Chen (1965) and Watson (1943) (latent heat), same reference text.
+* Chung, Ajlan, Lee & Starling (1988), Ind. Eng. Chem. Res. 27, 671 (vapour
+  viscosity); Herning & Zipperer (1936) (vapour mixing rule).
 * Kendall & Monroe (1917), J. Am. Chem. Soc. 39, 1787 (mixture viscosity).
 
 Known limitations
@@ -161,6 +166,26 @@ def latent_heat_jmol(T_K: float, Tb_K, Tc_K, Pc_bar):
     return dH_b * (one_minus_Tr / (1.0 - Tbr)) ** 0.38
 
 
+def vapour_viscosity_mpas(T_K: float, mw, Tc_K, Pc_bar, omega):
+    """Low-pressure vapour viscosity [mPa.s] of each component (Chung et al., 1988).
+
+        mu [uP] = 40.785 Fc sqrt(M T) / (Vc^(2/3) Omega_v)
+
+    with Fc = 1 - 0.2756 omega (nonpolar, no association), the Neufeld
+    collision integral Omega_v(T*), T* = 1.2593 T / Tc, and the critical volume
+    Vc [cm3/mol] = Zc R Tc / Pc with Zc = 0.291 - 0.08 omega.  Pressure
+    dependence is ignored, which is appropriate at vacuum.
+    """
+    mw = np.asarray(mw)
+    omega = np.asarray(omega)
+    Vc = (0.291 - 0.08 * omega) * 83.14 * np.asarray(Tc_K) / np.asarray(Pc_bar)   # cm3/mol
+    T_star = 1.2593 * T_K / np.asarray(Tc_K)
+    omega_v = (1.16145 * T_star ** -0.14874 + 0.52487 * np.exp(-0.77320 * T_star)
+               + 2.16178 * np.exp(-2.43787 * T_star))
+    mu_micropoise = 40.785 * (1.0 - 0.2756 * omega) * np.sqrt(mw * T_K) / (Vc ** (2.0 / 3.0) * omega_v)
+    return mu_micropoise * 1.0e-4          # 1 uP = 1e-4 mPa.s
+
+
 # --------------------------------------------------------------------------
 # Mixture properties at a state point
 # --------------------------------------------------------------------------
@@ -173,6 +198,7 @@ class FluidProps:
     p_mbar: float
     rho_L: float          # liquid density [kg/m3]
     rho_V: float          # vapour density [kg/m3]
+    mu_V: float           # vapour viscosity [mPa.s]
     mu_L: float           # liquid viscosity [mPa.s]
     sigma: float          # surface tension [mN/m]
     latent_kj_kg: float   # latent heat of the vapour mixture [kJ/kg]
@@ -228,10 +254,15 @@ def mixture_properties(
     M_v = float(np.sum(y * comps.mw))                 # g/mol
     rho_V = (p_mbar * 100.0) * (M_v / 1000.0) / (R_GAS * T)   # ideal gas
 
+    # Herning-Zipperer mixing of the pure-vapour viscosities
+    mu_Vi = vapour_viscosity_mpas(T, comps.mw, v.Tc_K, v.Pc_bar, v.omega)
+    sqrt_m = np.sqrt(comps.mw)
+    mu_V = float(np.sum(y * mu_Vi * sqrt_m) / np.sum(y * sqrt_m))
+
     dH_mol = float(np.sum(y * latent_heat_jmol(T, v.Tb_K, v.Tc_K, v.Pc_bar)))   # J/mol
     latent = dH_mol / M_v                             # J/g = kJ/kg
 
-    return FluidProps(T_c=T_c, p_mbar=p_mbar, rho_L=float(rho_L), rho_V=float(rho_V),
+    return FluidProps(T_c=T_c, p_mbar=p_mbar, rho_L=float(rho_L), rho_V=float(rho_V), mu_V=mu_V,
                       mu_L=float(mu_L), sigma=sigma, latent_kj_kg=float(latent),
                       mw_vapour=M_v)
 
@@ -253,7 +284,7 @@ if __name__ == "__main__":
     _, x_cut = feed.cut_composition(150.0, 250.0)
     print(f"Cut 150-250 C at {p:.0f} mbar, head T = {cut.T_mid_c:.1f} C")
     fp = mixture_properties(comps, x_cut, cut.T_mid_c, p)
-    print(f"  rho_L {fp.rho_L:7.1f} kg/m3 | rho_V {fp.rho_V:.4f} kg/m3 | mu_L {fp.mu_L:.3f} mPa.s | "
+    print(f"  rho_L {fp.rho_L:7.1f} kg/m3 | rho_V {fp.rho_V:.4f} kg/m3 | mu_V {fp.mu_V * 1000:.2f} uPa.s | mu_L {fp.mu_L:.3f} mPa.s | "
           f"sigma {fp.sigma:.1f} mN/m | latent {fp.latent_kj_kg:.0f} kJ/kg | M_v {fp.mw_vapour:.0f} g/mol")
 
     # State 2: whole feed as pot liquid at 20 C (a viscosity / density sanity check)
