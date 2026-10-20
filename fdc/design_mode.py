@@ -61,7 +61,8 @@ from .batch_pot import BatchResult, BatchSpec, SimSettings, ThermalModel, simula
 from .hetp import HETPModel, HETPResult, hetp as hetp_model, packed_height_required
 from .holdup import HoldupModel, internal_flows, liquid_holdup
 from .hydraulics import HydraulicsModel, column_hydraulics, flooding_vapour_rate
-from .packing import WALL_RATIO_MIN, ColumnGeometry, PackingSpec, column_geometry
+from .packing import (H_BOTTOM_DEFAULT, H_TOP_DEFAULT, WALL_RATIO_MIN, ColumnGeometry, PackingSpec,
+                      column_geometry)
 from .properties.feed import FeedCharacterisation
 from .properties.fluids import Components, mixture_properties
 from .properties.vle import analyse_cut
@@ -154,6 +155,8 @@ def design_column(
     sep: SeparationSpec = SeparationSpec(),
     targets: DesignTargets = DesignTargets(),
     efficiency: float = 0.70,
+    h_top_m: float = H_TOP_DEFAULT,
+    h_bottom_m: float = H_BOTTOM_DEFAULT,
     hold_model: HoldupModel = HoldupModel(),
     hyd_model: HydraulicsModel = HydraulicsModel(),
     hetp_cfg: HETPModel = HETPModel(),
@@ -171,6 +174,8 @@ def design_column(
     R                    : reflux ratio; default 1.3 x the minimum.
     sep                  : cut-sharpness spec (key recovery, grey-zone width).
     targets              : flooding margin, pressure-drop limit, diameter range.
+    h_top_m, h_bottom_m  : unpacked column height above and below the bed [m]; they set the
+                           column body height (H_pack + both) but not the separation.
     verify               : run the batch simulation on the designed column
                            (needs ``m_feed_kg``).
     """
@@ -206,7 +211,7 @@ def design_column(
     def geometry(D_mm: float, H_m: float) -> ColumnGeometry:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            return column_geometry(packing, D_mm, H_m)
+            return column_geometry(packing, D_mm, H_m, h_top_m, h_bottom_m)
 
     def percent_flood(D_mm: float) -> float:
         g = geometry(D_mm, 0.30)
