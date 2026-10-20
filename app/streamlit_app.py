@@ -112,6 +112,8 @@ class AppInputs:
     T_condenser_c: float
     D_mm: float
     H_pack_m: float
+    h_top_m: float
+    h_bottom_m: float
     kind: str
     size_mm: float
     void_fraction: float | None
@@ -174,6 +176,10 @@ def read_sidebar() -> AppInputs:
                                   key=f"eps_{kind}", disabled=not use_eps)
             d_mm = st.number_input("Column inner diameter (mm)", min_value=10.0, max_value=300.0, step=1.0, key="D_mm")
             h_pack = st.number_input("Packed height (m)", min_value=0.05, max_value=5.0, step=0.05, key="H_pack_m")
+            h_top = st.number_input("Unpacked column above the bed (m)", 0.0, 1.0, 0.15, 0.01, key="h_top",
+                                    help="Glass above the packing, up to the still head.")
+            h_bot = st.number_input("Unpacked column below the bed (m)", 0.0, 1.0, 0.10, 0.01, key="h_bottom",
+                                    help="Bed support and the glass between it and the flask neck.")
         with st.expander("Calibration and model constants"):
             k_hetp = st.number_input("HETP multiplier", 0.2, 5.0, 1.0, 0.1, key="k_hetp")
             use_wet = st.checkbox("Override wetted-area fraction (HETP and hold-up)", value=False, key="use_wet")
@@ -198,7 +204,7 @@ def read_sidebar() -> AppInputs:
     return AppInputs(
         tbp=pts, n_pseudo=n_pseudo, sg_feed=sg if use_sg else None, m_feed_kg=m_feed, T_lo_c=lo, T_hi_c=hi,
         r_key=r_key, gap_c=gap, p_top_mbar=p_top, R_auto=r_auto, R_manual=r_man, q_heater_w=q, efficiency=eff,
-        T_condenser_c=t_cond, D_mm=d_mm, H_pack_m=h_pack, kind=kind, size_mm=size,
+        T_condenser_c=t_cond, D_mm=d_mm, H_pack_m=h_pack, h_top_m=h_top, h_bottom_m=h_bot, kind=kind, size_mm=size,
         void_fraction=eps if use_eps else None, k_hetp=k_hetp, wetted_fraction=wet if use_wet else None,
         k_static=k_stat, k_dynamic=k_dyn, loading_coeff=load_c, Ea_kj_mol=ea, T_limit_c=t_lim)
 
@@ -264,7 +270,7 @@ def compute_live(key: str, _inp: AppInputs) -> Live:
     flows = internal_flows(inp.q_heater_w, fluid.latent_kj_kg, R_use, inp.efficiency)
 
     spec = PackingSpec(inp.kind, inp.size_mm, void_fraction=inp.void_fraction)
-    geom, m2 = run_captured(column_geometry, spec, inp.D_mm, inp.H_pack_m)
+    geom, m2 = run_captured(column_geometry, spec, inp.D_mm, inp.H_pack_m, inp.h_top_m, inp.h_bottom_m)
     notices += m2
     het, m3 = run_captured(hetp_model, geom, fluid, flows, gov.alpha, het_m)
     notices += m3
@@ -364,7 +370,7 @@ def operating_sheet(inp: AppInputs, live: Live, batch: dict | None) -> str:
          f"charge {inp.m_feed_kg:.2f} kg", "", "## Set-up", "",
          f"- P_top {inp.p_top_mbar:.0f} mbar, R = {live.R_use:.2f} ({'1.3 x minimum' if inp.R_auto else 'manual'}), "
          f"heater {inp.q_heater_w:.0f} W (efficiency {inp.efficiency:.2f})",
-         f"- Column {inp.D_mm:.0f} mm x {inp.H_pack_m:.2f} m packed, "
+         f"- Column {inp.D_mm:.0f} mm x {inp.H_pack_m:.2f} m packed ({live.geom.H_col_m:.2f} m body), "
          f"{'glass beads' if inp.kind == 'glass_beads' else 'steel wool'} {inp.size_mm:g} mm", "",
          "## What to watch", "",
          f"- Collect the cut while the head thermometer (TT-102) reads {live.cut.T_lo_c:.0f}\u2013{live.cut.T_hi_c:.0f} \u00b0C",
@@ -447,6 +453,10 @@ def tab_overview(inp: AppInputs, live: Live) -> None:
         with st.expander(f"Model notices ({len(live.notices)})"):
             for n in live.notices:
                 st.write("\u2022 " + n)
+    st.caption(f"Column body {live.geom.H_col_m:.2f} m ({live.geom.H_col_m * 3.281:.1f} ft) = packed {inp.H_pack_m:.2f} m "
+               f"({inp.H_pack_m * 3.281:.1f} ft) + {inp.h_top_m:.2f} m above + {inp.h_bottom_m:.2f} m below the bed. "
+               "The still head, condenser and flask neck sit on top of / below this. The unpacked lengths do not "
+               "affect the separation; only the packed height does.")
     show_schematic(live_state(inp, live))
 
 
@@ -520,7 +530,8 @@ def tab_design(inp: AppInputs, live: Live, fp: str) -> None:
     hold_m, hyd_m, het_m = models(inp)
     common = dict(feed=live.feed, T_lo_c=inp.T_lo_c, T_hi_c=inp.T_hi_c, q_heater_w=inp.q_heater_w,
                   R=None if inp.R_auto else inp.R_manual, sep=SeparationSpec(inp.r_key, inp.gap_c), targets=targets,
-                  efficiency=inp.efficiency, hold_model=hold_m, hyd_model=hyd_m, hetp_cfg=het_m)
+                  efficiency=inp.efficiency, h_top_m=inp.h_top_m, h_bottom_m=inp.h_bottom_m,
+                  hold_model=hold_m, hyd_model=hyd_m, hetp_cfg=het_m)
     spec_pk = PackingSpec(inp.kind, inp.size_mm, void_fraction=inp.void_fraction)
 
     if st.button("Design column", type="primary", key="btn_design"):
@@ -541,7 +552,8 @@ def tab_design(inp: AppInputs, live: Live, fp: str) -> None:
             st.warning("The inputs have changed since this design: press **Design column** to update it.")
         c = st.columns(4)
         c[0].metric("Diameter", f"{d.D_mm:.0f} mm", f"solved {d.D_solved_mm:.1f} mm, set by {d.limiting}", delta_color="off")
-        c[1].metric("Packed height", f"{d.H_pack_m:.2f} m", f"column {d.H_col_m:.2f} m", delta_color="off")
+        c[1].metric("Packed height", f"{d.H_pack_m:.2f} m ({d.H_pack_m * 3.281:.1f} ft)",
+                    f"column body {d.H_col_m:.2f} m ({d.H_col_m * 3.281:.1f} ft)", delta_color="off")
         c[2].metric("Stages", fnum(d.N_total), f"R = {d.R:.2f} (min {d.R_min:.2f})", delta_color="off")
         c[3].metric("HETP", f"{d.hetp_m * 1000:.0f} mm")
         c = st.columns(4)
